@@ -10,10 +10,9 @@ import {
   Paper,
   TextField,
   Typography,
-  MenuItem,
-  Chip
+  MenuItem
 } from "@mui/material";
-import { supabaseClient } from "../lib/supabaseClient";
+import { supabaseClient } from "@/lib/supabase/client";
 
 const sizes = [
   { value: "1280x720", label: "1280x720 (landscape)" },
@@ -30,7 +29,7 @@ const statusColors = {
 };
 
 export default function Home() {
-  const [session, setSession] = useState(null);
+  const [user, setUser] = useState(null);
   const [authEmail, setAuthEmail] = useState("");
   const [subscriptionActive, setSubscriptionActive] = useState(false);
   const [lookName, setLookName] = useState("SpringLookbook");
@@ -47,9 +46,7 @@ export default function Home() {
   const [output, setOutput] = useState("{}");
   const [loading, setLoading] = useState(false);
   const [batchRunning, setBatchRunning] = useState(false);
-  const [lastVideoId, setLastVideoId] = useState("");
-  const [videoStatus, setVideoStatus] = useState(null);
-  const [videoUrl, setVideoUrl] = useState("");
+  const [singleJob, setSingleJob] = useState(null);
 
   const [templateStyle, setTemplateStyle] = useState("");
   const [templateCamera, setTemplateCamera] = useState("");
@@ -141,59 +138,64 @@ export default function Home() {
   }, [referencePreviewUrl]);
 
   useEffect(() => {
-    supabaseClient.auth.getSession().then(({ data }) => {
-      setSession(data.session || null);
-    });
+    const init = async () => {
+      const { data } = await supabaseClient.auth.getSession();
+      setUser(data.session?.user || null);
+      if (data.session?.user) {
+        await fetchSubscriptionStatus();
+      }
+    };
+    init();
 
-    const { data: listener } = supabaseClient.auth.onAuthStateChange(
-      (_event, newSession) => {
-        setSession(newSession);
+    const { data: authListener } = supabaseClient.auth.onAuthStateChange(
+      async (_event, session) => {
+        setUser(session?.user || null);
+        if (session?.user) {
+          await fetchSubscriptionStatus();
+        } else {
+          setSubscriptionActive(false);
+        }
       }
     );
-    return () => listener.subscription.unsubscribe();
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
   }, []);
 
-  useEffect(() => {
-    const loadSubscription = async () => {
-      if (!session?.access_token) {
-        setSubscriptionActive(false);
-        return;
-      }
-      const res = await fetch("/api/subscription", {
-        headers: { Authorization: `Bearer ${session.access_token}` }
-      });
-      const data = await res.json();
-      setSubscriptionActive(Boolean(data.active));
-    };
-    loadSubscription();
-  }, [session?.access_token]);
-
-  const signIn = async () => {
-    if (!authEmail.trim()) return;
-    await supabaseClient.auth.signInWithOtp({ email: authEmail.trim() });
-    setOutput("Check your email for the sign-in link.");
+  const fetchSubscriptionStatus = async () => {
+    const res = await fetch("/api/subscription/status");
+    const data = await res.json();
+    setSubscriptionActive(Boolean(data.active));
   };
 
-  const signOut = async () => {
-    await supabaseClient.auth.signOut();
-    setSession(null);
-    setSubscriptionActive(false);
-  };
-
-  const openCheckout = async () => {
-    if (!session?.access_token) {
-      setOutput("Sign in to subscribe.");
+  const handleLogin = async () => {
+    if (!authEmail.trim()) {
+      setOutput("Email is required.");
       return;
     }
-    const res = await fetch("/api/stripe/checkout", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${session.access_token}` }
+    const { error } = await supabaseClient.auth.signInWithOtp({
+      email: authEmail.trim()
     });
+    if (error) {
+      setOutput(error.message);
+    } else {
+      setOutput("Check your email for the login link.");
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabaseClient.auth.signOut();
+    setUser(null);
+  };
+
+  const handleCheckout = async () => {
+    const res = await fetch("/api/stripe/checkout", { method: "POST" });
     const data = await res.json();
     if (data.url) {
       window.location.href = data.url;
     } else {
-      setOutput(JSON.stringify(data, null, 2));
+      setOutput(data.error || "Failed to start checkout");
     }
   };
 
@@ -236,6 +238,39 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
+  const createVideoJob = async (jobPrompt) => {
+    if (referenceFile) {
+      const form = new FormData();
+      form.append("prompt", jobPrompt);
+      form.append("size", size);
+      form.append("seconds", seconds);
+      if (referenceUrl.trim()) {
+        form.append("input_reference_url", referenceUrl.trim());
+      }
+      form.append("input_reference_file", referenceFile);
+
+      const res = await fetch("/api/videos/create", {
+        method: "POST",
+        body: form
+      });
+      const data = await res.json();
+      return { ok: res.ok, data };
+    }
+
+    const res = await fetch("/api/videos/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: jobPrompt,
+        size,
+        seconds,
+        input_reference_url: referenceUrl.trim() || undefined
+      })
+    });
+    const data = await res.json();
+    return { ok: res.ok, data };
+  };
+
   const handleGenerate = async () => {
     if (!prompt.trim()) {
       setOutput("Prompt is required.");
@@ -246,45 +281,18 @@ export default function Home() {
     setOutput("Submitting...");
 
     try {
-      let res;
-      if (referenceFile) {
-        const form = new FormData();
-        form.append("prompt", prompt);
-        form.append("size", size);
-        form.append("seconds", seconds);
-        if (referenceUrl.trim()) {
-          form.append("input_reference_url", referenceUrl.trim());
-        }
-        form.append("input_reference_file", referenceFile);
-
-        res = await fetch("/api/generate", {
-          method: "POST",
-          headers: session?.access_token
-            ? { Authorization: `Bearer ${session.access_token}` }
-            : undefined,
-          body: form
-        });
-      } else {
-        res = await fetch("/api/generate", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(session?.access_token
-              ? { Authorization: `Bearer ${session.access_token}` }
-              : {})
-          },
-          body: JSON.stringify({
-            prompt,
-            size,
-            seconds,
-            input_reference_url: referenceUrl.trim() || undefined
-          })
-        });
+      const result = await createVideoJob(prompt);
+      if (!result.ok) {
+        setOutput(JSON.stringify(result.data, null, 2));
+        return;
       }
-
-      const data = await res.json();
-      setLastVideoId(data.id || "");
-      setOutput(JSON.stringify(data, null, 2));
+      setSingleJob({
+        id: result.data.id,
+        status: result.data.status,
+        watermarkRequired: result.data.watermark_required,
+        outputUrl: null
+      });
+      setOutput(JSON.stringify(result.data, null, 2));
     } catch (err) {
       setOutput(err.message || "Unknown error");
     } finally {
@@ -294,44 +302,7 @@ export default function Home() {
 
   const runVariant = async (variant) => {
     const fullPrompt = `${prompt}\n\nVariant: ${variant}`;
-    if (referenceFile) {
-      const form = new FormData();
-      form.append("prompt", fullPrompt);
-      form.append("size", size);
-      form.append("seconds", seconds);
-      if (referenceUrl.trim()) {
-        form.append("input_reference_url", referenceUrl.trim());
-      }
-      form.append("input_reference_file", referenceFile);
-
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: session?.access_token
-          ? { Authorization: `Bearer ${session.access_token}` }
-          : undefined,
-        body: form
-      });
-      const data = await res.json();
-      return { ok: res.ok, data };
-    }
-
-    const res = await fetch("/api/generate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(session?.access_token
-          ? { Authorization: `Bearer ${session.access_token}` }
-          : {})
-      },
-      body: JSON.stringify({
-        prompt: fullPrompt,
-        size,
-        seconds,
-        input_reference_url: referenceUrl.trim() || undefined
-      })
-    });
-    const data = await res.json();
-    return { ok: res.ok, data };
+    return createVideoJob(fullPrompt);
   };
 
   const handleBatch = async () => {
@@ -355,7 +326,8 @@ export default function Home() {
       variantList.map((variant) => ({
         variant,
         status: "queued",
-        response: null
+        videoId: null,
+        outputUrl: null
       }))
     );
 
@@ -369,13 +341,29 @@ export default function Home() {
         );
 
         const result = await runVariant(variant);
+        if (!result.ok) {
+          setBatchResults((prev) =>
+            prev.map((item, i) =>
+              i === index
+                ? {
+                    ...item,
+                    status: "error",
+                    response: result.data
+                  }
+                : item
+            )
+          );
+          setOutput(JSON.stringify(result.data, null, 2));
+          continue;
+        }
         setBatchResults((prev) =>
           prev.map((item, i) =>
             i === index
               ? {
                   ...item,
-                  status: result.ok ? "success" : "error",
-                  response: result.ok ? result.data : { error: result.data }
+                  status: "queued",
+                  videoId: result.data.id,
+                  watermarkRequired: result.data.watermark_required
                 }
               : item
           )
@@ -389,6 +377,57 @@ export default function Home() {
     }
   };
 
+  const checkStatus = async (videoId) => {
+    if (!videoId) return null;
+    const res = await fetch(`/api/videos/status?id=${videoId}`);
+    const data = await res.json();
+    return { ok: res.ok, data };
+  };
+
+  const checkSingleStatus = async () => {
+    if (!singleJob?.id) return;
+    const result = await checkStatus(singleJob.id);
+    if (!result.ok) {
+      setOutput(JSON.stringify(result.data, null, 2));
+      return;
+    }
+    setSingleJob((prev) => ({
+      ...prev,
+      status: result.data.status,
+      outputUrl: result.data.output_url || prev.outputUrl
+    }));
+    setOutput(JSON.stringify(result.data, null, 2));
+  };
+
+  const checkVariantStatus = async (index) => {
+    const item = batchResults[index];
+    if (!item?.videoId) return;
+    const result = await checkStatus(item.videoId);
+    if (!result.ok) {
+      setOutput(JSON.stringify(result.data, null, 2));
+      return;
+    }
+    setBatchResults((prev) =>
+      prev.map((row, i) =>
+        i === index
+          ? {
+              ...row,
+              status: result.data.status || row.status,
+              outputUrl: result.data.output_url || row.outputUrl
+            }
+          : row
+      )
+    );
+    setOutput(JSON.stringify(result.data, null, 2));
+  };
+
+  const checkAllVariants = async () => {
+    for (let i = 0; i < batchResults.length; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await checkVariantStatus(i);
+    }
+  };
+
   const retryVariant = async (index) => {
     const item = batchResults[index];
     if (!item) return;
@@ -399,18 +438,35 @@ export default function Home() {
 
     try {
       const result = await runVariant(item.variant);
+      if (!result.ok) {
+        setBatchResults((prev) =>
+          prev.map((row, i) =>
+            i === index
+              ? {
+                  ...row,
+                  status: "error",
+                  response: result.data
+                }
+              : row
+          )
+        );
+        setOutput(JSON.stringify(result.data, null, 2));
+        return;
+      }
       setBatchResults((prev) =>
         prev.map((row, i) =>
           i === index
             ? {
                 ...row,
-                status: result.ok ? "success" : "error",
-                response: result.ok ? result.data : { error: result.data }
+                status: "queued",
+                videoId: result.data.id,
+                outputUrl: null,
+                watermarkRequired: result.data.watermark_required
               }
             : row
         )
       );
-      setOutput(JSON.stringify(result.ok ? result.data : result.data, null, 2));
+      setOutput(JSON.stringify(result.data, null, 2));
     } catch (err) {
       setBatchResults((prev) =>
         prev.map((row, i) =>
@@ -420,42 +476,6 @@ export default function Home() {
         )
       );
     }
-  };
-
-  const fetchStatus = async () => {
-    if (!lastVideoId) {
-      setOutput("No video id to check.");
-      return;
-    }
-    const res = await fetch(`/api/videos/${lastVideoId}/status`, {
-      headers: session?.access_token
-        ? { Authorization: `Bearer ${session.access_token}` }
-        : undefined
-    });
-    const data = await res.json();
-    setVideoStatus(data);
-    setOutput(JSON.stringify(data, null, 2));
-  };
-
-  const downloadVideo = async () => {
-    if (!lastVideoId) {
-      setOutput("No video id to download.");
-      return;
-    }
-    const res = await fetch(`/api/videos/${lastVideoId}/content`, {
-      headers: session?.access_token
-        ? { Authorization: `Bearer ${session.access_token}` }
-        : undefined
-    });
-    if (!res.ok) {
-      const data = await res.json();
-      setOutput(JSON.stringify(data, null, 2));
-      return;
-    }
-    const blob = await res.blob();
-    if (videoUrl) URL.revokeObjectURL(videoUrl);
-    const url = URL.createObjectURL(blob);
-    setVideoUrl(url);
   };
 
   const buildPromptFromTemplate = () => {
@@ -492,49 +512,42 @@ export default function Home() {
       </Typography>
 
       <Paper sx={{ p: 3, mb: 3 }}>
-        <Grid container spacing={2} alignItems="center">
-          <Grid item xs={12} sm={6}>
-            <Typography variant="h6">Account</Typography>
-            <Typography variant="body2" sx={{ color: "text.secondary" }}>
-              {session?.user?.email || "Not signed in"}
+        <Typography variant="h6" gutterBottom>
+          Account + Billing
+        </Typography>
+        {user ? (
+          <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+            <Typography variant="body2">Signed in as {user.email}</Typography>
+            <Typography variant="body2">
+              Subscription: {subscriptionActive ? "Active" : "Not active"}
             </Typography>
-          </Grid>
-          <Grid item xs={12} sm={6} sx={{ textAlign: { xs: "left", sm: "right" } }}>
-            <Chip
-              label={subscriptionActive ? "Subscribed" : "Free tier"}
-              color={subscriptionActive ? "success" : "default"}
-              sx={{ mr: 1 }}
-            />
-            {session ? (
-              <Button variant="outlined" onClick={signOut}>
-                Sign out
-              </Button>
+            {!subscriptionActive ? (
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                Non-subscribers receive watermarked videos.
+              </Typography>
             ) : null}
-          </Grid>
-          {!session ? (
-            <>
-              <Grid item xs={12} sm={8}>
-                <TextField
-                  label="Email"
-                  value={authEmail}
-                  onChange={(e) => setAuthEmail(e.target.value)}
-                  fullWidth
-                />
-              </Grid>
-              <Grid item xs={12} sm={4}>
-                <Button variant="contained" onClick={signIn} fullWidth>
-                  Send Magic Link
-                </Button>
-              </Grid>
-            </>
-          ) : (
-            <Grid item xs={12}>
-              <Button variant="contained" onClick={openCheckout}>
-                Subscribe (Remove Watermark)
+            <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap", mt: 1 }}>
+              <Button variant="contained" onClick={handleCheckout}>
+                Upgrade Subscription
               </Button>
-            </Grid>
-          )}
-        </Grid>
+              <Button variant="outlined" onClick={handleLogout}>
+                Log out
+              </Button>
+            </Box>
+          </Box>
+        ) : (
+          <Box sx={{ display: "flex", gap: 2, alignItems: "center" }}>
+            <TextField
+              label="Email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              size="small"
+            />
+            <Button variant="contained" onClick={handleLogin}>
+              Send Magic Link
+            </Button>
+          </Box>
+        )}
       </Paper>
 
       <Paper sx={{ p: 3, mb: 3 }}>
@@ -646,6 +659,33 @@ export default function Home() {
             Export Prompt Pack JSON
           </Button>
         </Box>
+        {singleJob ? (
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="body2">
+              Job ID: {singleJob.id} | Status: {singleJob.status}
+            </Typography>
+            {singleJob.watermarkRequired ? (
+              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                Watermark required for this job.
+              </Typography>
+            ) : null}
+            <Box sx={{ mt: 1, display: "flex", gap: 1, flexWrap: "wrap" }}>
+              <Button variant="outlined" onClick={checkSingleStatus}>
+                Check Status
+              </Button>
+              {singleJob.outputUrl ? (
+                <Button
+                  variant="contained"
+                  component="a"
+                  href={singleJob.outputUrl}
+                  target="_blank"
+                >
+                  Download
+                </Button>
+              ) : null}
+            </Box>
+          </Box>
+        ) : null}
       </Paper>
 
       <Paper sx={{ p: 3, mb: 3 }}>
@@ -763,6 +803,11 @@ export default function Home() {
           >
             Run Batch Variants
           </Button>
+          {batchResults.length ? (
+            <Button sx={{ ml: 2 }} variant="outlined" onClick={checkAllVariants}>
+              Check All Status
+            </Button>
+          ) : null}
         </Box>
         {batchResults.length ? (
           <Box sx={{ mt: 3 }}>
@@ -780,17 +825,18 @@ export default function Home() {
                     >
                       Status: {item.status}
                     </Typography>
+                    {item.videoId ? (
+                      <Typography variant="caption" sx={{ display: "block" }}>
+                        Job ID: {item.videoId}
+                      </Typography>
+                    ) : null}
                     <Box sx={{ mt: 1, display: "flex", gap: 1, flexWrap: "wrap" }}>
                       <Button
                         size="small"
                         variant="outlined"
-                        onClick={() =>
-                          setOutput(
-                            JSON.stringify(item.response || {}, null, 2)
-                          )
-                        }
+                        onClick={() => checkVariantStatus(index)}
                       >
-                        Show Response
+                        Check Status
                       </Button>
                       <Button
                         size="small"
@@ -800,48 +846,22 @@ export default function Home() {
                       >
                         Retry
                       </Button>
+                      {item.outputUrl ? (
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          component="a"
+                          href={item.outputUrl}
+                          target="_blank"
+                        >
+                          Download
+                        </Button>
+                      ) : null}
                     </Box>
                   </Paper>
                 </Grid>
               ))}
             </Grid>
-          </Box>
-        ) : null}
-      </Paper>
-
-      <Paper sx={{ p: 3, mb: 3 }}>
-        <Typography variant="h6" gutterBottom>
-          Latest Video
-        </Typography>
-        <Typography variant="body2" sx={{ color: "text.secondary", mb: 2 }}>
-          Free tier downloads are watermarked.
-        </Typography>
-        <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap", mb: 2 }}>
-          <Button variant="outlined" onClick={fetchStatus}>
-            Check Status
-          </Button>
-          <Button variant="contained" onClick={downloadVideo}>
-            Download / Preview
-          </Button>
-        </Box>
-        {lastVideoId ? (
-          <Typography variant="body2" sx={{ color: "text.secondary" }}>
-            Video ID: {lastVideoId}
-          </Typography>
-        ) : null}
-        {videoStatus ? (
-          <Typography variant="body2" sx={{ color: "text.secondary", mt: 1 }}>
-            Status: {videoStatus.status || "unknown"}
-          </Typography>
-        ) : null}
-        {videoUrl ? (
-          <Box sx={{ mt: 2 }}>
-            <Box
-              component="video"
-              src={videoUrl}
-              controls
-              sx={{ width: "100%", borderRadius: 2 }}
-            />
           </Box>
         ) : null}
       </Paper>

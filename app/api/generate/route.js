@@ -1,19 +1,7 @@
 export const runtime = "nodejs";
 
-import { supabaseAdmin } from "../../../lib/supabaseAdmin";
-
 const ALLOWED_SIZES = new Set(["1280x720", "720x1280"]);
 const ALLOWED_SECONDS = new Set(["4", "8", "12"]);
-
-async function getUserFromRequest(request) {
-  const authHeader = request.headers.get("authorization") || "";
-  const token = authHeader.replace("Bearer ", "").trim();
-  if (!token) return null;
-
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-  if (error) return null;
-  return data.user;
-}
 
 function validateInput({ prompt, size, seconds }) {
   if (!process.env.OPENAI_API_KEY) {
@@ -56,19 +44,6 @@ async function callSoraJson({ prompt, size, seconds, inputReferenceUrl }) {
   return { response, data };
 }
 
-async function recordVideo({ userId, video, prompt }) {
-  if (!userId || !video?.id) return;
-  await supabaseAdmin.from("videos").insert({
-    user_id: userId,
-    video_id: video.id,
-    prompt,
-    model: video.model,
-    seconds: video.seconds,
-    size: video.size,
-    status: video.status
-  });
-}
-
 async function callSoraMultipart({
   prompt,
   size,
@@ -105,7 +80,6 @@ export async function POST(request) {
 
   try {
     if (contentType.includes("multipart/form-data")) {
-      const user = await getUserFromRequest(request);
       const form = await request.formData();
       const prompt = form.get("prompt");
       const size = form.get("size") || "1280x720";
@@ -129,11 +103,9 @@ export async function POST(request) {
       if (!response.ok) {
         return Response.json({ error: data }, { status: response.status });
       }
-      await recordVideo({ userId: user?.id, video: data, prompt });
       return Response.json(data);
     }
 
-    const user = await getUserFromRequest(request);
     const body = await request.json();
     const {
       prompt,
@@ -157,7 +129,6 @@ export async function POST(request) {
     if (!response.ok) {
       return Response.json({ error: data }, { status: response.status });
     }
-    await recordVideo({ userId: user?.id, video: data, prompt });
     return Response.json(data);
   } catch (error) {
     return Response.json(
